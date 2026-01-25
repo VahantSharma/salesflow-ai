@@ -280,3 +280,80 @@ WHERE r.is_active = TRUE
 GROUP BY r.retailer_id, r.name, r.tier, r.beat_id, r.lifecycle_status
 HAVING COUNT(DISTINCT CASE WHEN t.transaction_date >= CURRENT_DATE - 28 
                            AND t.transaction_date < CURRENT_DATE - 14 THEN t.txn_id END) >= 2  -- Had activity before
+
+
+-- =============================================================================
+-- PHASE 5: APPROVALS TABLE - Human-in-the-Loop Governance
+-- =============================================================================
+-- Design Philosophy (CTO Approved):
+-- ═════════════════════════════════════════════════════════════════════════════
+-- 
+-- 1. APPEND-ONLY: Records cannot be updated or deleted after creation.
+--    Status changes create NEW records (audit trail pattern).
+-- 
+-- 2. POST-WORKFLOW: Approvals happen OUTSIDE the AI workflow.
+--    Workflow terminates → Findings persisted → Human acts → Approval recorded
+-- 
+-- 3. FINDING_ID IS PRIMARY KEY: Stable identity across re-runs.
+--    Do NOT use trace_id + retailer_id compound key.
+-- 
+-- 4. REJECTION IS OBSERVATIONAL: manager_context is for offline analytics.
+--    It is NEVER fed back into the AI decision system.
+-- 
+-- 5. EXPIRY IS DERIVED: SUPERSEDED status when new decision replaces old.
+--    No time-based expiry timers or background jobs.
+-- 
+-- ═════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS approvals (
+    -- === Identity ===
+    finding_id VARCHAR PRIMARY KEY,       -- UUID from Strategist
+    trace_id VARCHAR NOT NULL,            -- Links to DecisionTrace
+    decision_id VARCHAR,                  -- Groups findings from same workflow run
+    
+    -- === Retailer Context ===
+    retailer_id VARCHAR NOT NULL,
+    retailer_name VARCHAR NOT NULL,
+    tier VARCHAR DEFAULT 'Bronze' CHECK (tier IN ('Gold', 'Silver', 'Bronze')),
+    
+    -- === Recommendation Details ===
+    issue_type VARCHAR NOT NULL,          -- CHURN_RISK, CROSS_SELL_GAP, VALUE_DECLINE
+    severity VARCHAR NOT NULL CHECK (severity IN ('HIGH', 'MEDIUM', 'LOW')),
+    confidence_level VARCHAR DEFAULT 'MEDIUM' CHECK (confidence_level IN ('HIGH', 'MEDIUM', 'LOW')),
+    recommended_action TEXT NOT NULL,
+    action_type VARCHAR NOT NULL CHECK (action_type IN ('VISIT', 'CALL', 'MESSAGE')),
+    suggested_discount INTEGER CHECK (suggested_discount >= 0 AND suggested_discount <= 15),
+    
+    -- === Timing ===
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deadline_description VARCHAR,         -- "Within 48 hours", "Next visit cycle"
+    
+    -- === Approval Status ===
+    -- PENDING: Awaiting human decision
+    -- APPROVED: Manager accepted the recommendation
+    -- REJECTED: Manager declined with context
+    -- SUPERSEDED: Replaced by newer decision (not time-based expiry)
+    status VARCHAR DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'superseded')),
+    decided_at TIMESTAMP,
+    decided_by VARCHAR DEFAULT 'manager', -- Future: actual user ID from auth
+    
+    -- === Manager Context (For OFFLINE ANALYTICS ONLY) ===
+    -- This data is collected for operational analysis.
+    -- It is NOT consumed by the AI decision system.
+    rejection_category VARCHAR CHECK (
+        rejection_category IS NULL OR 
+        rejection_category IN ('incorrect_data', 'already_handled', 'wrong_priority', 'wrong_action', 'not_applicable', 'other')
+    ),
+    manager_context TEXT,                 -- Free-form notes
+    
+    -- === Supersession Tracking ===
+    superseded_by VARCHAR,                -- finding_id of replacement
+    superseded_at TIMESTAMP
+);
+
+-- Indexes for approvals table
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+CREATE INDEX IF NOT EXISTS idx_approvals_retailer ON approvals(retailer_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_trace ON approvals(trace_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_created ON approvals(created_at);
+CREATE INDEX IF NOT EXISTS idx_approvals_decided ON approvals(decided_at);

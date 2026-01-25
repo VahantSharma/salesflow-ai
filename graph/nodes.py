@@ -12,6 +12,18 @@ CRITICAL DESIGN RULE:
 - They only: unwrap state → call agent → merge output
 - All business logic lives in the agents
 
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  PHASE 4: Decision Trace Integration                                         ║
+║                                                                              ║
+║  Each node receives an OPTIONAL TraceWriter (write-only handle).             ║
+║  Nodes append trace entries but NEVER read the trace.                        ║
+║                                                                              ║
+║  The trace is passed separately from state to enforce the write-only         ║
+║  constraint. If trace_writer is None, tracing is disabled (graceful).        ║
+║                                                                              ║
+║  CRITICAL: Nodes must NOT make decisions based on trace contents.            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
 Node Types:
 1. guardrails_node: Input validation and topic classification
 2. analyst_node: SQL generation and execution
@@ -46,8 +58,19 @@ Usage:
 
 from typing import Any, Dict, Optional
 from datetime import datetime
+import time
 
 from graph.state import AgentState, add_error_to_state
+from graph.trace import (
+    TraceWriter,
+    GuardrailsTraceEntry,
+    AnalystTraceEntry,
+    StrategistTraceEntry,
+    CopywriterTraceEntry,
+    WorkflowTraceEntry,
+    DataProvenance,
+    SeverityComputation,
+)
 
 
 # === Agent instances (injected at workflow creation) ===
@@ -56,6 +79,10 @@ _analyst_agent = None
 _strategist_agent = None
 _copywriter_agent = None
 _guardrails_agent = None
+
+# === Trace writer (injected per-workflow execution) ===
+# This is write-only - nodes append but never read
+_trace_writer: Optional[TraceWriter] = None
 
 
 def set_agents(
@@ -80,29 +107,107 @@ def set_agents(
         _guardrails_agent = guardrails
 
 
+def set_trace_writer(writer: Optional[TraceWriter]):
+    """
+    Inject trace writer for current workflow execution.
+    
+    This is called at the START of each workflow execution.
+    The writer is WRITE-ONLY - nodes can append but never read.
+    
+    Args:
+        writer: TraceWriter instance or None to disable tracing
+    """
+    global _trace_writer
+    _trace_writer = writer
+
+
+def clear_trace_writer():
+    """
+    Clear trace writer after workflow completion.
+    
+    Called at workflow END to prevent accidental writes.
+    """
+    global _trace_writer
+    _trace_writer = None
+
+
 def guardrails_node(state: AgentState) -> Dict[str, Any]:
     """
     Validate user input and classify topic.
     
-    For Phase 2, this is a passthrough (guardrails implemented in Phase 5).
+    Phase 4: Now uses actual GuardrailsAgent implementation.
+    If no agent is configured, falls back to permissive passthrough.
     
     Args:
         state: Current workflow state
         
     Returns:
         State update with guardrails_result, is_on_topic, sanitized_query
+        (Note: sanitized_query == original query - we do NOT rewrite)
     """
-    # Phase 2: Passthrough - assume all queries are on-topic
-    # Guardrails will be implemented in Phase 5
+    global _guardrails_agent, _trace_writer
+    
+    start_time = time.time()
+    query = state['query']
+    
+    # If no guardrails agent, use permissive passthrough
+    if _guardrails_agent is None:
+        result = {
+            'current_node': 'guardrails',
+            'guardrails_result': {
+                'classification': 'allowed',
+                'original_query': query,
+                'detected_patterns': [],
+                'topic_category': 'general',
+                'intent': 'query',
+                'block_reason': None,
+            },
+            'is_on_topic': True,
+            'sanitized_query': query  # UNCHANGED - we do NOT rewrite
+        }
+        
+        # Write trace entry (if tracing enabled)
+        if _trace_writer:
+            try:
+                _trace_writer.write_guardrails(GuardrailsTraceEntry(
+                    timestamp=datetime.now(),
+                    original_query=query,
+                    classification='allowed',
+                    detected_patterns=[],
+                    topic_category='general',
+                    intent_label='query',
+                    block_reason=None,
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                ))
+            except RuntimeError:
+                pass  # Trace already written or finalized - ignore
+        
+        return result
+    
+    # Use actual GuardrailsAgent
+    validation_result = _guardrails_agent.validate(query)
+    
+    # Write trace entry (if tracing enabled)
+    if _trace_writer:
+        try:
+            _trace_writer.write_guardrails(GuardrailsTraceEntry(
+                timestamp=datetime.now(),
+                original_query=query,
+                classification=validation_result.classification,
+                detected_patterns=validation_result.detected_patterns,
+                topic_category=validation_result.topic_category,
+                intent_label=validation_result.intent,
+                block_reason=validation_result.block_reason,
+                execution_time_ms=validation_result.execution_time_ms,
+            ))
+        except RuntimeError:
+            pass  # Trace already written or finalized - ignore
+    
     return {
         'current_node': 'guardrails',
-        'guardrails_result': {
-            'classification': 'ON_TOPIC',
-            'confidence': 1.0,
-            'action': 'ALLOWED'
-        },
-        'is_on_topic': True,
-        'sanitized_query': state['query']
+        'guardrails_result': validation_result.to_dict(),
+        'is_on_topic': validation_result.is_allowed,
+        'sanitized_query': validation_result.original_query  # UNCHANGED
     }
 
 
@@ -120,7 +225,9 @@ def analyst_node(state: AgentState) -> Dict[str, Any]:
     Returns:
         State update with sql_query, query_results, view_used, etc.
     """
-    global _analyst_agent
+    global _analyst_agent, _trace_writer
+    
+    start_time = time.time()
     
     if _analyst_agent is None:
         return {
@@ -145,10 +252,40 @@ def analyst_node(state: AgentState) -> Dict[str, Any]:
     
     # Call analyst
     result = _analyst_agent.generate_query(query, retry_context)
+    execution_time = (time.time() - start_time) * 1000
     
     # Handle result
     if result['success']:
         # Success (including empty results)
+        
+        # Write trace entry (if tracing enabled)
+        if _trace_writer:
+            try:
+                # Build provenance from result
+                provenance = None
+                if result.get('view_used'):
+                    provenance = DataProvenance(
+                        view_used=result['view_used'],
+                        columns_accessed=result.get('columns_accessed', []),
+                        filter_applied=result.get('filter_applied'),
+                        aggregation_type=result.get('aggregation_type'),
+                        row_count_returned=result.get('result_metadata', {}).get('row_count'),
+                        retailer_ids_affected=None,  # Populated by strategist
+                    )
+                
+                _trace_writer.write_analyst(AnalystTraceEntry(
+                    timestamp=datetime.now(),
+                    sql_generated=result['sql'],
+                    sql_valid=True,
+                    execution_success=True,
+                    provenance=provenance,
+                    retry_count=retry_count,
+                    error_type=result.get('error_type'),  # May be EMPTY_RESULT
+                    execution_time_ms=execution_time,
+                ))
+            except RuntimeError:
+                pass  # Trace already written or finalized - ignore
+        
         return {
             'current_node': 'analyst',
             'sql_query': result['sql'],
@@ -161,6 +298,22 @@ def analyst_node(state: AgentState) -> Dict[str, Any]:
     else:
         # Error occurred
         error_type = result.get('error_type', 'SQL_ERROR')
+        
+        # Write trace entry for failed attempt (if tracing enabled)
+        if _trace_writer:
+            try:
+                _trace_writer.write_analyst(AnalystTraceEntry(
+                    timestamp=datetime.now(),
+                    sql_generated=result.get('sql', ''),
+                    sql_valid=False,
+                    execution_success=False,
+                    provenance=None,
+                    retry_count=retry_count,
+                    error_type=error_type,
+                    execution_time_ms=execution_time,
+                ))
+            except RuntimeError:
+                pass  # Trace already written or finalized - ignore
         
         # Determine if we should retry
         if error_type in ('SQL_ERROR', 'VALIDATION_ERROR') and retry_count < 2:
@@ -201,7 +354,9 @@ def strategist_node(state: AgentState) -> Dict[str, Any]:
     Returns:
         State update with insight, insight_type, priority, etc.
     """
-    global _strategist_agent
+    global _strategist_agent, _trace_writer
+    
+    start_time = time.time()
     
     if _strategist_agent is None:
         return {
@@ -233,6 +388,50 @@ def strategist_node(state: AgentState) -> Dict[str, Any]:
     # Call strategist
     try:
         result = _strategist_agent.analyze(analyst_output)
+        execution_time = (time.time() - start_time) * 1000
+        
+        # Write trace entry (if tracing enabled)
+        if _trace_writer:
+            try:
+                # Build severity computations from findings
+                severity_comps = []
+                findings = result.get('findings', [])
+                for finding in findings[:5]:  # Limit to first 5 for trace
+                    if finding.get('severity') and finding.get('metrics'):
+                        metrics = finding['metrics']
+                        # Document the deterministic severity computation
+                        if 'days_since_order' in metrics:
+                            severity_comps.append(SeverityComputation(
+                                rule_name='days_since_order_threshold',
+                                threshold_value=14,
+                                actual_value=metrics.get('days_since_order'),
+                                result=finding.get('severity', 'unknown').lower(),
+                            ))
+                
+                # Count tiers from findings
+                tier_dist = {'Gold': 0, 'Silver': 0, 'Bronze': 0}
+                for finding in findings:
+                    tier = finding.get('tier', '').title()
+                    if tier in tier_dist:
+                        tier_dist[tier] += 1
+                
+                # Get suppression info
+                suppression = []
+                for finding in findings:
+                    if finding.get('suppressed_crosssell'):
+                        suppression.append(f"crosssell_suppressed:{finding.get('retailer_id', 'unknown')}")
+                
+                _trace_writer.write_strategist(StrategistTraceEntry(
+                    timestamp=datetime.now(),
+                    findings_count=len(findings),
+                    actions_generated=result.get('summary', {}).get('total_issues', 0),
+                    severity_computations=severity_comps,
+                    suppression_applied=suppression,
+                    tier_distribution=tier_dist,
+                    execution_time_ms=execution_time,
+                ))
+            except RuntimeError:
+                pass  # Trace already written or finalized - ignore
         
         return {
             'current_node': 'strategist',
@@ -244,6 +443,7 @@ def strategist_node(state: AgentState) -> Dict[str, Any]:
             'evidence': result.get('evidence'),
             'business_impact': result.get('business_impact'),
             'confidence_level': result.get('confidence_level'),
+            'summary': result.get('summary'),  # Pre-computed for UI
         }
     except Exception as e:
         return {
@@ -267,7 +467,9 @@ def copywriter_node(state: AgentState) -> Dict[str, Any]:
     Returns:
         State update with messages, primary_message
     """
-    global _copywriter_agent
+    global _copywriter_agent, _trace_writer
+    
+    start_time = time.time()
     
     if _copywriter_agent is None:
         return {
@@ -300,6 +502,38 @@ def copywriter_node(state: AgentState) -> Dict[str, Any]:
     # Call copywriter
     try:
         result = _copywriter_agent.craft_message(insight)
+        execution_time = (time.time() - start_time) * 1000
+        
+        # Write trace entry (if tracing enabled)
+        if _trace_writer:
+            try:
+                # Determine tone from confidence level
+                confidence = state.get('confidence_level', 'MEDIUM')
+                tone_map = {
+                    'HIGH': 'urgent',
+                    'MEDIUM': 'concerned',
+                    'LOW': 'routine',
+                }
+                tone = tone_map.get(confidence, 'routine')
+                
+                # Get discount info - single source is Strategist
+                discount_value = None
+                findings = insight.get('findings', [])
+                for finding in findings:
+                    if finding.get('recommended_discount'):
+                        discount_value = finding['recommended_discount']
+                        break
+                
+                _trace_writer.write_copywriter(CopywriterTraceEntry(
+                    timestamp=datetime.now(),
+                    messages_generated=len(result.get('messages', [])) or 1,
+                    tone_used=tone,
+                    discount_source='strategist',  # CTO: Document discount source
+                    discount_value=discount_value,
+                    execution_time_ms=execution_time,
+                ))
+            except RuntimeError:
+                pass  # Trace already written or finalized - ignore
         
         return {
             'current_node': 'copywriter',

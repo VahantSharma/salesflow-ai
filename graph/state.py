@@ -14,6 +14,19 @@ State Design Philosophy:
 - Error states are explicit (not hidden in strings)
 - Errors accumulate for traceability (List[Dict])
 
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  PHASE 4 ADDITION: Decision Trace                                            ║
+║                                                                              ║
+║  Decision trace is handled separately from AgentState to enforce the         ║
+║  WRITE-ONLY constraint during execution.                                     ║
+║                                                                              ║
+║  • Agents receive a TraceWriter (write-only handle) via node parameters      ║
+║  • Agents CANNOT read the trace during execution                             ║
+║  • Only workflow completion returns the full trace for UI/logging            ║
+║                                                                              ║
+║  The trace is NOT stored in AgentState to prevent accidental reads.          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
 State Schema:
     AgentState {
         # User Input
@@ -47,6 +60,9 @@ State Schema:
         
         # Conversation (for multi-turn)
         chat_history: List[dict]      # Previous messages
+        
+        # Phase 4: Trace ID (reference only, not the trace itself)
+        trace_id: str | None          # For correlation, NOT for reading trace
     }
 
 Usage:
@@ -59,6 +75,39 @@ Usage:
 from typing import TypedDict, List, Optional, Any, Annotated
 from operator import add
 from datetime import datetime
+
+
+# =============================================================================
+# FIX #3: SUMMARY TYPEDDICT (STRONG TYPING FOR UI CONTRACT)
+# =============================================================================
+# Summary MUST be typed to enforce contract with UI.
+# UI reads these fields directly - they MUST exist if summary is not None.
+# If you add a field here, Strategist._compute_summary() MUST populate it.
+# =============================================================================
+class Summary(TypedDict, total=False):
+    """
+    Pre-computed summary statistics from Strategist.
+    
+    UI consumes these directly - no recomputation allowed.
+    All counts reflect POST-business-rule findings (e.g., after cross-sell suppression).
+    
+    INVARIANT: Every field here MUST be populated by Strategist._compute_summary().
+    """
+    # Issue counts
+    total_issues: int           # Total findings after business rules
+    churn_risks: int            # Count of CHURN_RISK findings
+    crosssell_opportunities: int  # Count of CROSS_SELL_GAP findings  
+    value_declines: int         # Count of VALUE_DECLINE findings
+    
+    # Severity breakdown
+    high_severity_count: int    # Findings with severity=HIGH
+    medium_severity_count: int  # Findings with severity=MEDIUM
+    low_severity_count: int     # Findings with severity=LOW
+    
+    # Tier impact (ALL tiers must be counted)
+    gold_tier_affected: int     # Findings affecting Gold tier retailers
+    silver_tier_affected: int   # Findings affecting Silver tier retailers
+    bronze_tier_affected: int   # Findings affecting Bronze tier retailers (FIX: Added)
 
 
 class AgentState(TypedDict):
@@ -96,6 +145,9 @@ class AgentState(TypedDict):
     evidence: Optional[List[str]]  # Supporting data points
     business_impact: Optional[str]  # Impact in business terms (e.g., "₹47,000 at risk")
     confidence_level: Optional[str]  # HIGH, MEDIUM, LOW - affects copywriter tone
+    # === Summary (Pre-computed for UI - UI must NOT recompute) ===
+    # FIX #3: Typed as Summary for strong contract enforcement
+    summary: Optional[Summary]  # Typed summary - see Summary TypedDict above
     
     # === Copywriter Stage ===
     messages: Optional[dict]  # Message variants (primary, whatsapp, internal_notes)
@@ -116,14 +168,21 @@ class AgentState(TypedDict):
     
     # === Conversation History (for multi-turn) ===
     chat_history: Annotated[List[dict], add]  # Accumulates messages
+    
+    # === Phase 4: Trace Reference ===
+    # NOTE: This is the trace ID only, NOT the trace itself.
+    # The actual trace is managed separately via TraceWriter to enforce WRITE-ONLY.
+    # Agents must NOT read trace data during execution.
+    trace_id: Optional[str]  # Correlation ID for audit trail
 
 
-def create_initial_state(query: str) -> AgentState:
+def create_initial_state(query: str, trace_id: Optional[str] = None) -> AgentState:
     """
     Create a fresh state for a new query.
     
     Args:
         query: User's natural language question
+        trace_id: Optional trace ID for audit trail (Phase 4)
         
     Returns:
         Initialized AgentState ready for workflow
@@ -155,6 +214,7 @@ def create_initial_state(query: str) -> AgentState:
         evidence=None,
         business_impact=None,
         confidence_level=None,
+        summary=None,  # Pre-computed counts for UI
         
         # Copywriter
         messages=None,
@@ -171,7 +231,10 @@ def create_initial_state(query: str) -> AgentState:
         error_stage=None,
         
         # Conversation
-        chat_history=[]
+        chat_history=[],
+        
+        # Phase 4: Trace Reference
+        trace_id=trace_id
     )
 
 

@@ -71,12 +71,34 @@ Usage:
 """
 
 import json
+import uuid
 from typing import Any, Dict, List, Optional
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage, HumanMessage
 import pandas as pd
 
 from config.prompts import STRATEGIST_SYSTEM_PROMPT
+
+
+def generate_finding_id() -> str:
+    """
+    Generate a stable finding_id (UUID).
+    
+    This is the PRIMARY IDENTITY for approval tracking.
+    Called when creating findings to ensure each has unique identity.
+    
+    Using UUID ensures:
+    - Uniqueness across runs
+    - No collision with re-analysis of same retailer
+    - Stable identity for approval tracking
+    
+    Phase 5 (Human-in-the-Loop):
+    ----------------------------
+    finding_id is used by ApprovalManager as the primary key.
+    Do NOT use trace_id + retailer_id as compound key - that fails
+    when same retailer has multiple findings or re-runs.
+    """
+    return str(uuid.uuid4())
 
 
 class StrategistAgent:
@@ -133,6 +155,35 @@ class StrategistAgent:
         }
     }
     
+    # =========================================================================
+    # COLUMN MAPPING (FIX #2 - ROBUST COLUMN RESOLUTION)
+    # =========================================================================
+    # Maps insight types to possible DataFrame column names from views.
+    # This decouples Strategist from exact view schema naming.
+    # 
+    # Views defined in data/schema.sql:
+    #   v_churn_candidates: orders_last_14d, orders_prior_14d, days_since_order
+    #   v_retailer_performance: orders_last_30d, orders_prior_30d, value_last_30d, value_prior_30d
+    #   v_retailer_categories: category, purchase_count
+    # =========================================================================
+    COLUMN_MAP = {
+        'CHURN_RISK': {
+            'current': ['orders_last_14d', 'orders_last_30d'],
+            'baseline': ['orders_prior_14d', 'orders_prior_30d'],
+            'days_since_order': ['days_since_order'],
+        },
+        'VALUE_DECLINE': {
+            'current': ['value_last_30d', 'value_last_14d'],
+            'baseline': ['value_prior_30d', 'value_prior_14d'],
+        },
+        'CROSS_SELL_GAP': {
+            'affinity_score': ['affinity_score'],
+            'purchase_count': ['purchase_count'],
+            'has_category': ['category', 'category_a'],
+            'missing_category': ['category_b', 'missing_category'],
+        }
+    }
+    
     # Priority hierarchy (lower = higher priority)
     PRIORITY_ORDER = {
         'CHURN_RISK': 1,
@@ -162,6 +213,7 @@ class StrategistAgent:
     }
     
     # Tier priority (higher value = higher priority)
+    # NOTE: Keys are title-case to match database. Normalize incoming tiers.
     TIER_PRIORITY = {
         'Gold': 3,
         'Silver': 2,
@@ -176,6 +228,44 @@ class StrategistAgent:
             llm: LangChain chat model (GPT-4-turbo recommended)
         """
         self.llm = llm
+    
+    @staticmethod
+    def _get_first_existing(row_data: dict, candidates: List[str], default=None):
+        """
+        Get the first existing column value from a list of candidates.
+        
+        This allows flexible column resolution across different view schemas.
+        
+        Args:
+            row_data: Dictionary of column values from DataFrame row
+            candidates: List of column names to try, in order of preference
+            default: Default value if no candidate exists
+            
+        Returns:
+            Value from first matching column, or default
+        """
+        for col in candidates:
+            if col in row_data and row_data[col] is not None:
+                return row_data[col]
+        return default
+    
+    @staticmethod
+    def _normalize_tier(tier: str) -> str:
+        """
+        Normalize tier to title case for consistency.
+        
+        Database uses 'Gold', 'Silver', 'Bronze' (title case).
+        LLM might return 'GOLD', 'gold', etc.
+        
+        Args:
+            tier: Tier string in any case
+            
+        Returns:
+            Title-cased tier string
+        """
+        if not tier:
+            return 'Bronze'  # Default tier
+        return tier.strip().title()
     
     def analyze(self, analyst_output: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -246,6 +336,31 @@ class StrategistAgent:
         top_severity = top_finding.get('severity', 'LOW') if top_finding else 'LOW'
         suggested_discount = self.DISCOUNT_CAPS.get(top_severity, 5)
         
+        # =======================================================================
+        # INJECT METRICS INTO FINDINGS (DETERMINISTIC - FROM DATAFRAME)
+        # =======================================================================
+        # Metrics MUST come from the DataFrame, NOT from LLM parsing.
+        # LLM can explain, but code extracts the numbers.
+        # This ensures charts have reliable, deterministic data.
+        # =======================================================================
+        prioritized['findings'] = self._inject_metrics_from_dataframe(
+            prioritized['findings'], 
+            results, 
+            insight_type
+        )
+        
+        # Update top_finding with metrics
+        top_finding = prioritized['findings'][0] if prioritized['findings'] else None
+        
+        # =======================================================================
+        # COMPUTE SUMMARY (POST-BUSINESS-RULES)
+        # =======================================================================
+        # Summary MUST reflect what user sees, not raw findings.
+        # Cross-sell suppression has already happened at this point.
+        # UI displays these counts directly - no recomputation allowed.
+        # =======================================================================
+        summary = self._compute_summary(prioritized['findings'])
+        
         return {
             'success': True,
             'insight_type': insight_type,
@@ -258,7 +373,8 @@ class StrategistAgent:
             'business_impact': self._calculate_business_impact(prioritized['findings']),
             'evidence': self._extract_evidence(prioritized['findings']),
             'suppressed_crosssell': prioritized.get('suppressed_crosssell', False),
-            'suggested_discount': suggested_discount  # Single source of truth for discounts
+            'suggested_discount': suggested_discount,  # Single source of truth for discounts
+            'summary': summary  # Pre-computed counts for UI (UI must NOT recompute)
         }
     
     def _detect_insight_type(
@@ -324,6 +440,15 @@ class StrategistAgent:
         data_str = df_subset.to_string(index=False)
         
         # Build prompt
+        # =================================================================
+        # LLM PROMPT DESIGN (FIX: CLARIFIED - NO NUMBER COMPUTATION)
+        # =================================================================
+        # LLM's job: DESCRIBE patterns, IDENTIFY retailers, EXPLAIN why
+        # LLM must NOT: Compute percentages, determine severity, assign priority
+        # 
+        # Numbers in output are REFERENCE ONLY - code re-extracts from DataFrame
+        # This prevents hallucination from creeping into metrics
+        # =================================================================
         prompt = f"""Analyze this {insight_type} data and identify specific findings.
 
 USER QUESTION: {query}
@@ -332,11 +457,12 @@ DATA (first {len(df_subset)} rows):
 {data_str}
 
 RULES:
-1. Only cite numbers that appear in the data above
-2. Each finding must reference a specific retailer_id and name
-3. Extract the raw metrics (days_since_order, order counts, change percentages)
-4. For each finding, explain WHY it matters in business terms
-5. Do NOT determine severity - it will be computed deterministically in code
+1. IDENTIFY retailers that show concerning patterns in the data
+2. REFERENCE the column values you see (e.g., days_since_order, orders_last_14d)
+3. EXPLAIN in business terms WHY each retailer matters
+4. Do NOT compute percentages or changes - just cite the raw numbers you see
+5. Do NOT determine severity or priority - that is computed by code
+6. Each finding must have: retailer_id, retailer_name, tier, explanation
 
 Return a JSON array of findings. Example format:
 [
@@ -344,12 +470,7 @@ Return a JSON array of findings. Example format:
     "retailer_id": "R-0001",
     "retailer_name": "Kumar Stores",
     "tier": "Gold",
-    "metric": "orders_last_14d",
-    "current_value": 1,
-    "baseline_value": 5,
-    "change_percent": -80,
-    "days_since_order": 14,
-    "explanation": "Order frequency dropped 80% in 14 days"
+    "explanation": "Has not ordered in 14 days, down from 5 orders in prior period"
   }}
 ]
 
@@ -535,29 +656,44 @@ Return ONLY the JSON array, no other text.
     def _compute_churn_severity(self, data: Dict[str, Any]) -> str:
         """
         Deterministic churn severity based on days inactive OR order decline.
+        
+        REFERENCES SEVERITY_THRESHOLDS (Single Source of Truth):
+        - HIGH: days_since_order > 14 OR decline > 30%
+        - MEDIUM: days_since_order > 7 OR decline > 15%
+        - LOW: everything else
         """
+        # Get thresholds from SEVERITY_THRESHOLDS (single source of truth)
+        high_thresholds = self.SEVERITY_THRESHOLDS['CHURN_RISK']['HIGH']
+        medium_thresholds = self.SEVERITY_THRESHOLDS['CHURN_RISK']['MEDIUM']
+        
+        days_high = high_thresholds['days_since_order']      # 14
+        decline_high = high_thresholds['decline_percent']     # 30
+        days_medium = medium_thresholds['days_since_order']   # 7
+        decline_medium = medium_thresholds['decline_percent'] # 15
+        
+        # Check days since order
         days = data.get('days_since_order', data.get('current_value', 0))
-        if isinstance(days, (int, float)) and days > 14:
+        if isinstance(days, (int, float)) and days > days_high:
             return 'HIGH'
         
         # Check order frequency change
         change = data.get('change_percent', 0)
-        if change and change < -30:
+        if change and change < -decline_high:
             return 'HIGH'
-        if change and change < -15:
+        if change and change < -decline_medium:
             return 'MEDIUM'
         
-        # Check orders comparison
+        # Check orders comparison (compute decline if not pre-computed)
         current = data.get('orders_last_14d', data.get('orders_last_30d', 0))
         prior = data.get('orders_prior_14d', data.get('orders_prior_30d', 0))
         if prior and prior > 0:
             decline_pct = ((current - prior) / prior) * 100
-            if decline_pct < -30:
+            if decline_pct < -decline_high:
                 return 'HIGH'
-            if decline_pct < -15:
+            if decline_pct < -decline_medium:
                 return 'MEDIUM'
         
-        if isinstance(days, (int, float)) and days > 7:
+        if isinstance(days, (int, float)) and days > days_medium:
             return 'MEDIUM'
         
         return 'LOW'
@@ -565,13 +701,27 @@ Return ONLY the JSON array, no other text.
     def _compute_crosssell_severity(self, data: Dict[str, Any]) -> str:
         """
         Deterministic cross-sell severity based on affinity + purchase history.
+        
+        REFERENCES SEVERITY_THRESHOLDS (Single Source of Truth):
+        - HIGH: affinity > 0.6 AND purchases >= 10
+        - MEDIUM: affinity > 0.5 AND purchases >= 5
+        - LOW: everything else
         """
+        # Get thresholds from SEVERITY_THRESHOLDS (single source of truth)
+        high_thresholds = self.SEVERITY_THRESHOLDS['CROSS_SELL_GAP']['HIGH']
+        medium_thresholds = self.SEVERITY_THRESHOLDS['CROSS_SELL_GAP']['MEDIUM']
+        
+        affinity_high = high_thresholds['affinity_score']     # 0.6
+        purchase_high = high_thresholds['purchase_count']     # 10
+        affinity_medium = medium_thresholds['affinity_score'] # 0.5
+        purchase_medium = medium_thresholds['purchase_count'] # 5
+        
         affinity = data.get('affinity_score', 0)
         purchases = data.get('purchase_count', 0)
         
-        if affinity > 0.6 and purchases >= 10:
+        if affinity > affinity_high and purchases >= purchase_high:
             return 'HIGH'
-        if affinity > 0.5 and purchases >= 5:
+        if affinity > affinity_medium and purchases >= purchase_medium:
             return 'MEDIUM'
         
         return 'LOW'
@@ -579,22 +729,34 @@ Return ONLY the JSON array, no other text.
     def _compute_value_severity(self, data: Dict[str, Any]) -> str:
         """
         Deterministic value decline severity based on % change.
+        
+        REFERENCES SEVERITY_THRESHOLDS (Single Source of Truth):
+        - HIGH: decline > 25%
+        - MEDIUM: decline > 10%
+        - LOW: everything else
         """
+        # Get thresholds from SEVERITY_THRESHOLDS (single source of truth)
+        high_thresholds = self.SEVERITY_THRESHOLDS['VALUE_DECLINE']['HIGH']
+        medium_thresholds = self.SEVERITY_THRESHOLDS['VALUE_DECLINE']['MEDIUM']
+        
+        decline_high = high_thresholds['decline_percent']     # 25
+        decline_medium = medium_thresholds['decline_percent'] # 10
+        
         change = data.get('change_percent', 0)
         
-        if change and change < -25:
+        if change and change < -decline_high:
             return 'HIGH'
-        if change and change < -10:
+        if change and change < -decline_medium:
             return 'MEDIUM'
         
-        # Check raw values
+        # Check raw values if change_percent not available
         current = data.get('value_last_30d', data.get('current_value', 0))
         prior = data.get('value_prior_30d', data.get('baseline_value', 0))
         if prior and prior > 0:
             decline_pct = ((current - prior) / prior) * 100
-            if decline_pct < -25:
+            if decline_pct < -decline_high:
                 return 'HIGH'
-            if decline_pct < -10:
+            if decline_pct < -decline_medium:
                 return 'MEDIUM'
         
         return 'LOW'
@@ -643,6 +805,16 @@ Return ONLY the JSON array, no other text.
             priority = 'P3_MEDIUM'
         else:
             priority = 'P4_LOW'
+        
+        # =================================================================
+        # FIX: INJECT PRIORITY INTO EACH FINDING (CTO CRITICAL #2)
+        # =================================================================
+        # UI does: priority = finding.get('priority', 'P3_MEDIUM')
+        # Without this injection, findings silently default → hides bugs.
+        # Each finding must carry its priority for consistent UI rendering.
+        # =================================================================
+        for f in sorted_findings:
+            f['priority'] = priority
         
         # Determine action type
         action_type = self.ACTION_MAPPING.get(
@@ -773,6 +945,216 @@ Return ONLY the JSON array, no other text.
                 evidence.append(exp)
         return evidence
     
+    def _inject_metrics_from_dataframe(
+        self,
+        findings: List[Dict[str, Any]],
+        results: pd.DataFrame,
+        insight_type: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Inject structured metrics into each finding FROM THE DATAFRAME.
+        
+        =======================================================================
+        CRITICAL: METRICS MUST BE DATAFRAME-DERIVED, NOT LLM-DERIVED
+        =======================================================================
+        The LLM may describe patterns, but NUMBERS must come from data.
+        This ensures:
+        1. Charts have reliable, verifiable data
+        2. Metrics are deterministic and reproducible
+        3. No hallucinated numbers in UI
+        
+        The LLM can explain WHY something matters, but not WHAT the numbers are.
+        
+        FIX #2: Uses COLUMN_MAP for dynamic column resolution.
+        No longer hardcodes column names like 'orders_last_14d'.
+        =======================================================================
+        """
+        if results is None or results.empty:
+            return findings
+        
+        # Build lookup from DataFrame
+        data_lookup = {}
+        id_col = 'retailer_id' if 'retailer_id' in results.columns else None
+        if id_col:
+            for _, row in results.iterrows():
+                rid = str(row.get(id_col, ''))
+                data_lookup[rid] = row.to_dict()
+        
+        # Get column mapping for this insight type
+        col_map = self.COLUMN_MAP.get(insight_type, {})
+        
+        for finding in findings:
+            rid = str(finding.get('retailer_id', ''))
+            row_data = data_lookup.get(rid, {})
+            
+            # ==================================================================
+            # FIX #4: NORMALIZE TIER TO TITLE CASE
+            # ==================================================================
+            # Database stores 'Gold', 'Silver', 'Bronze' (title case).
+            # LLM might return 'GOLD', 'gold', etc.
+            # Normalize here to ensure TIER_PRIORITY lookups work.
+            # ==================================================================
+            if 'tier' in finding:
+                finding['tier'] = self._normalize_tier(finding['tier'])
+            elif 'tier' in row_data:
+                finding['tier'] = self._normalize_tier(str(row_data.get('tier', 'Bronze')))
+            
+            # ==================================================================
+            # ENFORCE retailer_id PRESENCE (CONTROLLED FAILURE)
+            # ==================================================================
+            # retailer_id is NOT optional. Every valid finding must have one.
+            # 
+            # WHY ValueError INSTEAD OF assert:
+            # - assert is stripped with -O flag in production
+            # - ValueError is catchable, loggable, recoverable
+            # - Explicit exception beats silent default
+            #
+            # Callers can catch this and filter out invalid findings.
+            # ==================================================================
+            if not finding.get('retailer_id'):
+                raise ValueError(
+                    f"Finding missing required retailer_id. "
+                    f"Finding keys: {list(finding.keys())}. "
+                    f"This indicates upstream LLM or validation bug."
+                )
+            
+            # Initialize metrics dict
+            metrics = {}
+            
+            # ==================================================================
+            # GENERATE FINDING_ID (PHASE 5: HUMAN-IN-THE-LOOP IDENTITY)
+            # ==================================================================
+            # finding_id is the PRIMARY KEY for approval tracking.
+            # Generated here (single place) to ensure:
+            # - Every finding gets a unique ID
+            # - ID is stable for this finding's lifecycle
+            # - ApprovalManager can track by finding_id
+            #
+            # This happens AFTER validation but BEFORE persistence.
+            # ==================================================================
+            if not finding.get('finding_id'):
+                finding['finding_id'] = generate_finding_id()
+            
+            if insight_type == 'CHURN_RISK':
+                # FIX #2: Use dynamic column resolution via COLUMN_MAP
+                current_candidates = col_map.get('current', [])
+                baseline_candidates = col_map.get('baseline', [])
+                days_candidates = col_map.get('days_since_order', [])
+                
+                current_val = self._get_first_existing(row_data, current_candidates)
+                baseline_val = self._get_first_existing(row_data, baseline_candidates)
+                days_val = self._get_first_existing(row_data, days_candidates)
+                
+                if current_val is not None:
+                    metrics['current'] = int(current_val)
+                if baseline_val is not None:
+                    metrics['baseline'] = int(baseline_val)
+                if days_val is not None:
+                    metrics['days_since_order'] = int(days_val)
+                
+                # Compute change_percent deterministically
+                if metrics.get('baseline', 0) > 0:
+                    metrics['change_percent'] = round(
+                        ((metrics.get('current', 0) - metrics['baseline']) / metrics['baseline']) * 100, 
+                        1
+                    )
+                else:
+                    metrics['change_percent'] = 0
+                    
+            elif insight_type == 'CROSS_SELL_GAP':
+                # FIX #2: Use dynamic column resolution
+                affinity_candidates = col_map.get('affinity_score', [])
+                purchase_candidates = col_map.get('purchase_count', [])
+                has_cat_candidates = col_map.get('has_category', [])
+                missing_cat_candidates = col_map.get('missing_category', [])
+                
+                affinity_val = self._get_first_existing(row_data, affinity_candidates)
+                purchase_val = self._get_first_existing(row_data, purchase_candidates)
+                has_cat = self._get_first_existing(row_data, has_cat_candidates)
+                missing_cat = self._get_first_existing(row_data, missing_cat_candidates)
+                
+                if affinity_val is not None:
+                    metrics['affinity_score'] = float(affinity_val)
+                if purchase_val is not None:
+                    metrics['purchase_count'] = int(purchase_val)
+                if has_cat:
+                    metrics['has_category'] = has_cat
+                if missing_cat:
+                    metrics['missing_category'] = missing_cat
+                elif 'missing_category' in finding:
+                    metrics['missing_category'] = finding.get('missing_category', '')
+                    
+            elif insight_type == 'VALUE_DECLINE':
+                # FIX #2: Use dynamic column resolution
+                current_candidates = col_map.get('current', [])
+                baseline_candidates = col_map.get('baseline', [])
+                
+                current_val = self._get_first_existing(row_data, current_candidates)
+                baseline_val = self._get_first_existing(row_data, baseline_candidates)
+                
+                if current_val is not None:
+                    metrics['current'] = float(current_val)
+                if baseline_val is not None:
+                    metrics['baseline'] = float(baseline_val)
+                
+                if metrics.get('baseline', 0) > 0:
+                    metrics['change_percent'] = round(
+                        ((metrics.get('current', 0) - metrics['baseline']) / metrics['baseline']) * 100,
+                        1
+                    )
+                else:
+                    metrics['change_percent'] = 0
+            
+            # Inject metrics into finding
+            finding['metrics'] = metrics
+        
+        return findings
+    
+    def _compute_summary(self, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Compute summary statistics from POST-BUSINESS-RULE findings.
+        
+        =======================================================================
+        CRITICAL: SUMMARY REFLECTS WHAT USER SEES, NOT RAW FINDINGS
+        =======================================================================
+        This summary is computed AFTER:
+        1. Cross-sell suppression (if HIGH churn)
+        2. Severity filtering
+        3. Priority sorting
+        
+        UI MUST use these counts directly. UI cannot recompute them.
+        If UI needs different counts, add them HERE, not in UI code.
+        =======================================================================
+        """
+        if not findings:
+            return {
+                'total_issues': 0,
+                'churn_risks': 0,
+                'crosssell_opportunities': 0,
+                'value_declines': 0,
+                'high_severity_count': 0,
+                'medium_severity_count': 0,
+                'low_severity_count': 0,
+                'gold_tier_affected': 0,
+                'silver_tier_affected': 0,
+                'bronze_tier_affected': 0,  # FIX: Added bronze count
+            }
+        
+        summary = {
+            'total_issues': len(findings),
+            'churn_risks': sum(1 for f in findings if f.get('insight_type') == 'CHURN_RISK'),
+            'crosssell_opportunities': sum(1 for f in findings if f.get('insight_type') == 'CROSS_SELL_GAP'),
+            'value_declines': sum(1 for f in findings if f.get('insight_type') == 'VALUE_DECLINE'),
+            'high_severity_count': sum(1 for f in findings if f.get('severity') == 'HIGH'),
+            'medium_severity_count': sum(1 for f in findings if f.get('severity') == 'MEDIUM'),
+            'low_severity_count': sum(1 for f in findings if f.get('severity') == 'LOW'),
+            'gold_tier_affected': sum(1 for f in findings if f.get('tier') == 'Gold'),
+            'silver_tier_affected': sum(1 for f in findings if f.get('tier') == 'Silver'),
+            'bronze_tier_affected': sum(1 for f in findings if f.get('tier') == 'Bronze'),  # FIX: Added
+        }
+        
+        return summary
+    
     def _create_empty_insight(self, query: str, view_used: Optional[str]) -> Dict[str, Any]:
         """
         Create insight for empty results (valid answer, not error).
@@ -802,6 +1184,20 @@ Return ONLY the JSON array, no other text.
         This is NOT an error state - it's a successful determination.
         =======================================================================
         """
+        # Empty summary for NO_ISSUES case
+        empty_summary = {
+            'total_issues': 0,
+            'churn_risks': 0,
+            'crosssell_opportunities': 0,
+            'value_declines': 0,
+            'high_severity_count': 0,
+            'medium_severity_count': 0,
+            'low_severity_count': 0,
+            'gold_tier_affected': 0,
+            'silver_tier_affected': 0,
+            'bronze_tier_affected': 0,  # FIX: Added bronze count
+        }
+        
         return {
             'success': True,
             'insight_type': 'NO_ISSUES',
@@ -813,7 +1209,9 @@ Return ONLY the JSON array, no other text.
             'confidence_level': 'HIGH',  # Confident that nothing is wrong
             'business_impact': 'No immediate concerns',
             'evidence': [f"Query returned no results matching criteria"],
-            'suppressed_crosssell': False
+            'suppressed_crosssell': False,
+            'suggested_discount': 0,
+            'summary': empty_summary  # UI needs this even for empty results
         }
     
     def calculate_impact(self, insight: Dict[str, Any]) -> float:

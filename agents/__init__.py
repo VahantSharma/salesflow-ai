@@ -23,6 +23,9 @@ Usage:
     from agents.strategist import StrategistAgent
     from agents.copywriter import CopywriterAgent
     from agents.guardrails import GuardrailsAgent
+    from agents.strategist import generate_finding_id
 """
 
-__all__ = ["analyst", "strategist", "copywriter", "guardrails"]
+from agents.strategist import generate_finding_id
+
+__all__ = ["analyst", "strategist", "copywriter", "guardrails", "generate_finding_id"]
