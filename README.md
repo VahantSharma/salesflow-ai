@@ -126,6 +126,3 @@ salesflow_ai/
 
 ---
 
-## License
-
-MIT License - Built for Salescode.ai interview demonstration.
