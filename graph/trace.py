@@ -39,7 +39,7 @@ FORBIDDEN in provenance:
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Final
+from typing import Optional, List, Dict, Any, Final, Literal
 from enum import Enum
 import json
 
@@ -51,6 +51,29 @@ class TraceEntryType(Enum):
     STRATEGIST = "strategist"
     COPYWRITER = "copywriter"
     WORKFLOW = "workflow"  # For workflow-level events (start, end, routing)
+
+
+class IntegrityStatus(Enum):
+    """
+    Trace integrity status - CTO Correction #2.
+    
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║  PHASE 6 CTO FIX: DecisionTrace must be all-or-nothing                       ║
+    ║                                                                              ║
+    ║  Partial traces are WORSE than no trace because:                             ║
+    ║  - They imply completeness when incomplete                                   ║
+    ║  - Auditors may trust partial data                                           ║
+    ║  - Downstream systems may operate on partial state                           ║
+    ║                                                                              ║
+    ║  Every trace MUST declare its integrity status:                              ║
+    ║  - COMPLETE: All expected agents wrote entries                               ║
+    ║  - PARTIAL: Some agents wrote, some didn't (suspicious)                      ║
+    ║  - FAILED: Error prevented trace completion                                  ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+    """
+    COMPLETE = "complete"   # All expected agents wrote entries for the outcome
+    PARTIAL = "partial"     # Some agents wrote, some didn't - SUSPICIOUS
+    FAILED = "failed"       # Error prevented trace completion
 
 
 # =============================================================================
@@ -335,6 +358,13 @@ class DecisionTrace:
     -----------------
     approval_entries: List of HITL approval events (appended POST-workflow)
     These link human decisions back to the originating trace.
+    
+    v4 CTO Fix: Version Metadata
+    ---------------------------
+    For deterministic replay, we must capture the EXACT versions of:
+    - System (code) version
+    - Configuration ruleset versions
+    This enables "replay with same config" for compliance audits.
     """
     trace_id: str
     started_at: datetime
@@ -352,14 +382,35 @@ class DecisionTrace:
     # Phase 5: HITL approval events (appended POST-workflow)
     approval_entries: List[ApprovalTraceEntry] = field(default_factory=list)
     
+    # Phase 6: Trace integrity status (CTO Correction #2)
+    # MUST be set during finalize() - starts as FAILED until proven otherwise
+    integrity_status: IntegrityStatus = IntegrityStatus.FAILED
+    
+    # Phase 6: Decision ID for end-to-end correlation
+    decision_id: Optional[str] = None
+    
+    # v4 CTO Fix: Version metadata for deterministic replay
+    # These are captured at trace creation time and are IMMUTABLE
+    system_version: str = field(default="1.0.0")  # Code/deployment version
+    strategist_ruleset_version: str = field(default="1.0.0")  # Business rules version
+    analyst_query_version: str = field(default="1.0.0")  # Data query templates version
+    
     def to_dict(self) -> dict:
         """Serialize the complete trace for logging/storage."""
         result = {
             "trace_id": self.trace_id,
+            "decision_id": self.decision_id,  # Phase 6
             "started_at": self.started_at.isoformat(),
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "original_query": self.original_query,
             "final_outcome": self.final_outcome,
+            "integrity_status": self.integrity_status.value,  # Phase 6
+            # v4 CTO Fix: Version metadata for deterministic replay
+            "version_metadata": {
+                "system_version": self.system_version,
+                "strategist_ruleset_version": self.strategist_ruleset_version,
+                "analyst_query_version": self.analyst_query_version,
+            },
             "entries": {
                 "guardrails": self.guardrails_entry.to_dict() if self.guardrails_entry else None,
                 "analyst": self.analyst_entry.to_dict() if self.analyst_entry else None,
@@ -500,10 +551,71 @@ class TraceWriter:
     # FINALIZATION
     # =========================================================================
     
+    def _compute_integrity_status(self, outcome: str) -> IntegrityStatus:
+        """
+        Compute trace integrity based on outcome and entries written.
+        
+        ╔══════════════════════════════════════════════════════════════════════════╗
+        ║  PHASE 6 CTO FIX: Integrity is outcome-dependent                         ║
+        ║                                                                          ║
+        ║  Different outcomes require different entries:                           ║
+        ║  - 'blocked': Only guardrails expected                                   ║
+        ║  - 'empty_result': Guardrails + Analyst expected                         ║
+        ║  - 'success': All 4 agents expected                                      ║
+        ║  - 'error': At least one entry expected (where it failed)               ║
+        ╚══════════════════════════════════════════════════════════════════════════╝
+        """
+        has_guardrails = self._trace.guardrails_entry is not None
+        has_analyst = self._trace.analyst_entry is not None
+        has_strategist = self._trace.strategist_entry is not None
+        has_copywriter = self._trace.copywriter_entry is not None
+        
+        entries_written = sum([has_guardrails, has_analyst, has_strategist, has_copywriter])
+        
+        if outcome == 'blocked':
+            # Blocked at guardrails - only guardrails entry expected
+            if has_guardrails and not has_analyst and not has_strategist and not has_copywriter:
+                return IntegrityStatus.COMPLETE
+            elif has_guardrails:
+                return IntegrityStatus.PARTIAL  # Extra entries for blocked? Suspicious
+            else:
+                return IntegrityStatus.FAILED  # Blocked but no guardrails entry
+                
+        elif outcome == 'empty_result':
+            # Analyst returned no data - Guardrails + Analyst expected
+            expected = 2
+            if has_guardrails and has_analyst and not has_strategist and not has_copywriter:
+                return IntegrityStatus.COMPLETE
+            elif entries_written >= 1:
+                return IntegrityStatus.PARTIAL
+            else:
+                return IntegrityStatus.FAILED
+                
+        elif outcome == 'success':
+            # Full pipeline - all 4 agents expected
+            if entries_written == 4:
+                return IntegrityStatus.COMPLETE
+            elif entries_written >= 1:
+                return IntegrityStatus.PARTIAL
+            else:
+                return IntegrityStatus.FAILED
+                
+        elif outcome == 'error':
+            # Error somewhere - at least one entry expected (where we got to)
+            if entries_written >= 1:
+                return IntegrityStatus.PARTIAL  # Error = always partial (didn't complete)
+            else:
+                return IntegrityStatus.FAILED  # Error before any writes
+        
+        # Unknown outcome
+        return IntegrityStatus.FAILED
+    
     def finalize(self, outcome: str) -> None:
         """
         Mark the trace as complete.
-        After this, no more writes are allowed.
+        After this, no more writes are allowed (except approval events).
+        
+        Phase 6 Enhancement: Computes integrity_status based on outcome.
         
         Args:
             outcome: 'success' | 'empty_result' | 'error' | 'blocked'
@@ -511,21 +623,68 @@ class TraceWriter:
         self._check_not_finalized()
         self._trace.completed_at = datetime.now()
         self._trace.final_outcome = outcome
+        
+        # Phase 6: Compute and set integrity status BEFORE marking finalized
+        self._trace.integrity_status = self._compute_integrity_status(outcome)
+        
         self._finalized = True
+    
+    def set_decision_id(self, decision_id: str) -> None:
+        """
+        Set the decision_id for this trace.
+        
+        Phase 6: decision_id links all findings from a single workflow run.
+        Must be called BEFORE finalize() for full correlation.
+        
+        Args:
+            decision_id: UUID string from workflow
+        """
+        self._check_not_finalized()
+        if not decision_id:
+            raise ValueError("decision_id cannot be empty")
+        self._trace.decision_id = decision_id
+
+
+# =============================================================================
+# VERSION CONSTANTS (v4 CTO Fix: Deterministic Replay)
+# =============================================================================
+# These constants capture the current versions of each component.
+# They are frozen at trace creation time for audit/replay purposes.
+#
+# In production, these would be:
+# - SYSTEM_VERSION: Git commit hash or semantic version
+# - STRATEGIST_RULESET_VERSION: Hash of strategist rules/thresholds
+# - ANALYST_QUERY_VERSION: Hash of SQL templates
+
+SYSTEM_VERSION: Final[str] = "1.0.0"
+STRATEGIST_RULESET_VERSION: Final[str] = "1.0.0"  # Increment when business rules change
+ANALYST_QUERY_VERSION: Final[str] = "1.0.0"  # Increment when data queries change
 
 
 # =============================================================================
 # TRACE FACTORY
 # =============================================================================
 
-def create_trace(trace_id: str, original_query: str) -> tuple[DecisionTrace, TraceWriter]:
+def create_trace(
+    trace_id: str, 
+    original_query: str,
+    decision_id: Optional[str] = None
+) -> tuple[DecisionTrace, TraceWriter]:
     """
     Create a new trace and its write-only handle.
     
+    Phase 6 Enhancement: Accepts optional decision_id for correlation.
+    v4 CTO Fix: Captures version metadata for deterministic replay.
+    
     Usage:
-        trace, writer = create_trace("uuid-here", "show me churn risk")
+        trace, writer = create_trace("uuid-here", "show me churn risk", "decision-uuid")
         # Pass `writer` to agents (write-only)
         # Keep `trace` for final read after workflow completes
+    
+    Args:
+        trace_id: Unique identifier for this trace
+        original_query: User's query
+        decision_id: Optional decision ID for workflow correlation (Phase 6)
     
     Returns:
         tuple: (DecisionTrace for reading, TraceWriter for writing)
@@ -534,6 +693,11 @@ def create_trace(trace_id: str, original_query: str) -> tuple[DecisionTrace, Tra
         trace_id=trace_id,
         started_at=datetime.now(),
         original_query=original_query,
+        decision_id=decision_id,
+        # v4 CTO Fix: Capture version metadata at trace creation
+        system_version=SYSTEM_VERSION,
+        strategist_ruleset_version=STRATEGIST_RULESET_VERSION,
+        analyst_query_version=ANALYST_QUERY_VERSION,
     )
     writer = TraceWriter(trace)
     return trace, writer
@@ -547,6 +711,8 @@ def get_execution_summary(trace: DecisionTrace) -> dict:
     """
     Generate a human-readable summary of the trace.
     FOR UI/LOGGING ONLY - never used in agent logic.
+    
+    v4 CTO Fix: Includes version metadata for audit purposes.
     """
     total_time = None
     if trace.completed_at and trace.started_at:
@@ -562,9 +728,17 @@ def get_execution_summary(trace: DecisionTrace) -> dict:
     
     return {
         "trace_id": trace.trace_id,
+        "decision_id": trace.decision_id,  # Phase 6
         "query": trace.original_query[:100] + "..." if len(trace.original_query) > 100 else trace.original_query,
         "outcome": trace.final_outcome,
+        "integrity_status": trace.integrity_status.value,  # Phase 6
         "total_time_ms": total_time,
+        # v4 CTO Fix: Include version metadata
+        "version_metadata": {
+            "system_version": trace.system_version,
+            "strategist_ruleset_version": trace.strategist_ruleset_version,
+            "analyst_query_version": trace.analyst_query_version,
+        },
         "agents_executed": [
             name for name, entry in [
                 ("guardrails", trace.guardrails_entry),

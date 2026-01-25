@@ -68,6 +68,11 @@ from persistence.approvals import (
     DuplicateApprovalError,
     TransactionError,
     DecisionIdRequiredError,
+    InvalidStateTransition,  # v4 CTO Fix: State machine enforcement
+    
+    # State machine validation (v4 CTO Fix)
+    ALLOWED_TRANSITIONS,
+    validate_state_transition,
     
     # Utilities
     generate_finding_id,
@@ -96,6 +101,11 @@ __all__ = [
     'DuplicateApprovalError',
     'TransactionError',
     'DecisionIdRequiredError',
+    'InvalidStateTransition',  # v4 CTO Fix
+    
+    # State machine (v4 CTO Fix)
+    'ALLOWED_TRANSITIONS',
+    'validate_state_transition',
     
     # Utilities
     'generate_finding_id',

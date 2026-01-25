@@ -174,15 +174,22 @@ class AgentState(TypedDict):
     # The actual trace is managed separately via TraceWriter to enforce WRITE-ONLY.
     # Agents must NOT read trace data during execution.
     trace_id: Optional[str]  # Correlation ID for audit trail
+    
+    # === Phase 6: Decision ID (End-to-End Correlation) ===
+    # decision_id groups all findings from a single workflow run.
+    # Generated at workflow start, flows through to ApprovalManager.
+    # This enables: "Show all findings from this decision" queries.
+    decision_id: Optional[str]  # Workflow correlation ID
 
 
-def create_initial_state(query: str, trace_id: Optional[str] = None) -> AgentState:
+def create_initial_state(query: str, trace_id: Optional[str] = None, decision_id: Optional[str] = None) -> AgentState:
     """
     Create a fresh state for a new query.
     
     Args:
         query: User's natural language question
         trace_id: Optional trace ID for audit trail (Phase 4)
+        decision_id: Optional decision ID for workflow correlation (Phase 6)
         
     Returns:
         Initialized AgentState ready for workflow
@@ -234,7 +241,10 @@ def create_initial_state(query: str, trace_id: Optional[str] = None) -> AgentSta
         chat_history=[],
         
         # Phase 4: Trace Reference
-        trace_id=trace_id
+        trace_id=trace_id,
+        
+        # Phase 6: Decision ID
+        decision_id=decision_id
     )
 
 

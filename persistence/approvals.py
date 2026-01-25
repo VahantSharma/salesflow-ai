@@ -154,6 +154,80 @@ class RejectionCategory(Enum):
 
 
 # =============================================================================
+# STATE MACHINE (v4 CTO FIX: ENFORCED, NOT JUST DOCUMENTED)
+# =============================================================================
+
+# The AUTHORITATIVE state transition map.
+# This is enforced at runtime - illegal transitions raise InvalidStateTransition.
+#
+# KEY INVARIANTS:
+# 1. Terminal states (APPROVED, REJECTED, EXPIRED) have NO outgoing transitions
+# 2. SUPERSEDED can ONLY come from PENDING (newer finding replaces older)
+# 3. All human decisions are IRREVERSIBLE
+# 4. APPROVED → SUPERSEDED is explicitly FORBIDDEN (CTO: if user approved it, system keeps it)
+#
+# State diagram:
+#
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │                                                             │
+#   │  ┌─────────┐                                                │
+#   │  │ PENDING │ ─────────┬──────────┬──────────┬────────────── │
+#   │  └─────────┘          │          │          │              │
+#   │       │               │          │          │              │
+#   │       ▼               ▼          ▼          ▼              │
+#   │  ┌──────────┐   ┌──────────┐ ┌───────┐ ┌───────────┐       │
+#   │  │ APPROVED │   │ REJECTED │ │EXPIRED│ │SUPERSEDED │       │
+#   │  │(terminal)│   │(terminal)│ │(term) │ │ (terminal)│       │
+#   │  └──────────┘   └──────────┘ └───────┘ └───────────┘       │
+#   │                                                             │
+#   └─────────────────────────────────────────────────────────────┘
+#
+ALLOWED_TRANSITIONS: Final[Dict[ApprovalStatus, frozenset]] = {
+    # PENDING can transition to any terminal state
+    ApprovalStatus.PENDING: frozenset({
+        ApprovalStatus.APPROVED,
+        ApprovalStatus.REJECTED,
+        ApprovalStatus.SUPERSEDED,
+        ApprovalStatus.EXPIRED,
+    }),
+    # Terminal states - NO outgoing transitions
+    ApprovalStatus.APPROVED: frozenset(),    # Human decision: FINAL
+    ApprovalStatus.REJECTED: frozenset(),    # Human decision: FINAL
+    ApprovalStatus.SUPERSEDED: frozenset(),  # System decision: FINAL
+    ApprovalStatus.EXPIRED: frozenset(),     # Time-based: FINAL
+}
+
+
+def validate_state_transition(
+    from_status: ApprovalStatus,
+    to_status: ApprovalStatus,
+    finding_id: str,
+) -> None:
+    """
+    Validate that a state transition is legal.
+    
+    This is the ENFORCED state machine - not just documentation.
+    
+    Args:
+        from_status: Current state
+        to_status: Desired next state
+        finding_id: For error messages
+        
+    Raises:
+        InvalidStateTransition: If transition is illegal
+    """
+    allowed = ALLOWED_TRANSITIONS.get(from_status, frozenset())
+    
+    if to_status not in allowed:
+        raise InvalidStateTransition(
+            f"Illegal state transition for finding {finding_id}: "
+            f"{from_status.value} → {to_status.value}. "
+            f"Allowed transitions from {from_status.value}: "
+            f"{[s.value for s in allowed] if allowed else 'NONE (terminal state)'}"
+        )
+
+
+# =============================================================================
 # DATA CLASSES
 # =============================================================================
 
@@ -591,6 +665,27 @@ class DecisionIdRequiredError(Exception):
     pass
 
 
+class InvalidStateTransition(Exception):
+    """
+    Raised when an illegal state transition is attempted.
+    
+    v4 CTO Fix: State machine is ENFORCED, not just documented.
+    
+    Legal transitions:
+        PENDING → APPROVED, REJECTED, SUPERSEDED, EXPIRED
+        APPROVED → (nothing - terminal)
+        REJECTED → (nothing - terminal)
+        SUPERSEDED → (nothing - terminal)
+        EXPIRED → (nothing - terminal)
+    
+    Example illegal transitions that this catches:
+        APPROVED → REJECTED (trying to change human decision)
+        REJECTED → APPROVED (trying to undo rejection)
+        APPROVED → SUPERSEDED (CTO: if user approved, system keeps it)
+    """
+    pass
+
+
 # =============================================================================
 # APPROVAL MANAGER (Event-Sourced, v4 Production-Grade)
 # =============================================================================
@@ -985,24 +1080,27 @@ class ApprovalManager:
             ApprovalNotFoundError: If finding doesn't exist
             ApprovalAlreadyDecidedError: If not in PENDING state
             DuplicateApprovalError: If approval already exists (from constraint)
+            InvalidStateTransition: If state machine transition is illegal
         """
         # Pre-check current state (advisory)
         current = self._get_current_state(finding_id)
         if current is None:
             raise ApprovalNotFoundError(f"Finding {finding_id} not found")
         
-        if current.status != ApprovalStatus.PENDING:
-            # v3/v4 CTO Fix: Distinguish duplicate vs cross-decision
-            if current.status == ApprovalStatus.APPROVED:
-                # Same operation again → DuplicateApprovalError (idempotent signal)
-                raise DuplicateApprovalError(
-                    f"Finding {finding_id} already APPROVED"
-                )
-            else:
-                # Different operation (trying approve after reject) → cross-decision blocked
-                raise ApprovalAlreadyDecidedError(
-                    f"Finding {finding_id} already decided: {current.status.value}"
-                )
+        # v4 CTO Fix: Check idempotency FIRST (same operation twice)
+        # This preserves backward compatibility with DuplicateApprovalError
+        if current.status == ApprovalStatus.APPROVED:
+            raise DuplicateApprovalError(
+                f"Finding {finding_id} already APPROVED"
+            )
+        
+        # v4 CTO Fix: Then ENFORCE state machine (different operation on terminal state)
+        # This catches cases like approved → rejected which are illegal
+        validate_state_transition(
+            from_status=current.status,
+            to_status=ApprovalStatus.APPROVED,
+            finding_id=finding_id,
+        )
         
         # === Get authoritative timestamp (CTO Fix: Clock consistency) ===
         now = self._get_db_timestamp()
@@ -1072,24 +1170,27 @@ class ApprovalManager:
             ApprovalNotFoundError: If finding doesn't exist
             ApprovalAlreadyDecidedError: If not in PENDING state
             DuplicateApprovalError: If rejection already exists (from constraint)
+            InvalidStateTransition: If state machine transition is illegal
         """
         # Pre-check current state (advisory)
         current = self._get_current_state(finding_id)
         if current is None:
             raise ApprovalNotFoundError(f"Finding {finding_id} not found")
         
-        if current.status != ApprovalStatus.PENDING:
-            # v3/v4 CTO Fix: Distinguish duplicate vs cross-decision
-            if current.status == ApprovalStatus.REJECTED:
-                # Same operation again → DuplicateApprovalError (idempotent signal)
-                raise DuplicateApprovalError(
-                    f"Finding {finding_id} already REJECTED"
-                )
-            else:
-                # Different operation (trying reject after approve) → cross-decision blocked
-                raise ApprovalAlreadyDecidedError(
-                    f"Finding {finding_id} already decided: {current.status.value}"
-                )
+        # v4 CTO Fix: Check idempotency FIRST (same operation twice)
+        # This preserves backward compatibility with DuplicateApprovalError
+        if current.status == ApprovalStatus.REJECTED:
+            raise DuplicateApprovalError(
+                f"Finding {finding_id} already REJECTED"
+            )
+        
+        # v4 CTO Fix: Then ENFORCE state machine (different operation on terminal state)
+        # This catches cases like rejected → approved which are illegal
+        validate_state_transition(
+            from_status=current.status,
+            to_status=ApprovalStatus.REJECTED,
+            finding_id=finding_id,
+        )
         
         # === Get authoritative timestamp (CTO Fix: Clock consistency) ===
         now = self._get_db_timestamp()
@@ -1414,6 +1515,7 @@ class ApprovalManager:
         We only supersede when a new finding arrives for the SAME issue type.
         
         v4: Now accepts timestamp parameter for transactional consistency.
+        v4 CTO Fix: State machine validation - only PENDING can be SUPERSEDED.
         """
         now = timestamp or self._get_db_timestamp()
         
@@ -1428,6 +1530,17 @@ class ApprovalManager:
             """, [retailer_id, issue_type, new_finding_id]).fetchall()
             
             for (old_finding_id,) in result:
+                # v4 CTO Fix: Validate state transition
+                # PENDING → SUPERSEDED is legal, but double-check current state
+                current = self._get_current_state(old_finding_id)
+                if current and current.status != ApprovalStatus.PENDING:
+                    # Race condition: status changed between SELECT and now
+                    _logger.warning(
+                        f"Skipping supersede for {old_finding_id}: "
+                        f"status is {current.status.value}, not PENDING"
+                    )
+                    continue
+                
                 # Append supersession event
                 supersede_event = ApprovalEvent(
                     event_id=str(uuid.uuid4()),
@@ -1458,6 +1571,7 @@ class ApprovalManager:
                     finding_id != new_finding_id):
                     
                     latest = self._get_latest_event(finding_id)
+                    # v4 CTO Fix: Only supersede if current state is PENDING
                     if latest and latest.event_type == EventType.PENDING_CREATED:
                         supersede_event = ApprovalEvent(
                             event_id=str(uuid.uuid4()),

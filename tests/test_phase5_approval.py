@@ -39,6 +39,7 @@ from persistence.approvals import (
     ApprovalAlreadyDecidedError,
     ApprovalNotFoundError,
     DuplicateApprovalError,  # CTO v3: Idempotency enforcement
+    InvalidStateTransition,  # v4 CTO: State machine enforcement
     generate_finding_id,
 )
 
@@ -284,7 +285,10 @@ class TestApprovalManagerInMemory:
             in_memory_manager.approve(record.finding_id)
     
     def test_reject_already_decided_raises(self, in_memory_manager, sample_finding):
-        """Cannot reject an already approved/rejected record."""
+        """Cannot reject an already approved/rejected record.
+        
+        v4 CTO Fix: Now raises InvalidStateTransition for cross-decision attempts.
+        """
         record = in_memory_manager.create_pending(
             finding=sample_finding,
             trace_id='trace-001',
@@ -292,7 +296,8 @@ class TestApprovalManagerInMemory:
         )
         in_memory_manager.approve(record.finding_id)
         
-        with pytest.raises(ApprovalAlreadyDecidedError):
+        # v4: Cross-decision (approved → rejected) raises InvalidStateTransition
+        with pytest.raises(InvalidStateTransition):
             in_memory_manager.reject(
                 record.finding_id,
                 RejectionCategory.INCORRECT_DATA
@@ -1008,6 +1013,8 @@ class TestCTOv3Invariants:
     def test_cross_decision_blocked(self, db_manager, sample_finding):
         """
         CTO v3: Cannot approve an already-rejected finding (or vice versa).
+        
+        v4 CTO Fix: Now raises InvalidStateTransition for cross-decision attempts.
         """
         record = db_manager.create_pending(
             finding=sample_finding,
@@ -1021,8 +1028,8 @@ class TestCTOv3Invariants:
             rejection_category=RejectionCategory.NOT_APPLICABLE
         )
         
-        # Attempt to approve should fail
-        with pytest.raises((ApprovalAlreadyDecidedError, DuplicateApprovalError)):
+        # Attempt to approve should fail with InvalidStateTransition (v4)
+        with pytest.raises(InvalidStateTransition):
             db_manager.approve(record.finding_id)
     
     def test_event_ordering_deterministic(self, db_manager, sample_finding):
@@ -1088,6 +1095,10 @@ class TestCTOv3Invariants:
         the system may only append knowledge — never reinterpret it.
         
         This is the core guarantee of the approval system.
+        
+        v4 CTO Fix: Uses specific exception types:
+        - DuplicateApprovalError for idempotent operations (same op twice)
+        - InvalidStateTransition for cross-decisions (different op on terminal state)
         """
         record = db_manager.create_pending(
             finding=sample_finding,
@@ -1100,11 +1111,11 @@ class TestCTOv3Invariants:
         
         # Verify no API exists to "undo" or "change" the decision
         # The only allowed subsequent action is supersession (new finding)
-        with pytest.raises((ApprovalAlreadyDecidedError, DuplicateApprovalError)):
-            db_manager.approve(record.finding_id)  # Cannot re-approve
+        with pytest.raises(DuplicateApprovalError):
+            db_manager.approve(record.finding_id)  # Cannot re-approve (idempotent)
         
-        with pytest.raises((ApprovalAlreadyDecidedError, DuplicateApprovalError)):
-            db_manager.reject(record.finding_id, RejectionCategory.OTHER)  # Cannot reject after approve
+        with pytest.raises(InvalidStateTransition):
+            db_manager.reject(record.finding_id, RejectionCategory.OTHER)  # Cannot reject after approve (cross-decision)
         
         # The record status is final
         final_record = db_manager.get_by_finding_id(record.finding_id)

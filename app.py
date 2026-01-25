@@ -45,6 +45,17 @@ def init_session_state() -> None:
     
     Every field that UI uses must be initialized here.
     This prevents KeyError and ensures consistent behavior.
+    
+    ╔══════════════════════════════════════════════════════════════════════════╗
+    ║  PHASE 6 CTO CORRECTION #3: Session State is COSMETIC                    ║
+    ║                                                                          ║
+    ║  Session state is for UI responsiveness ONLY.                            ║
+    ║  Backend (ApprovalService) is ALWAYS the source of truth.                ║
+    ║                                                                          ║
+    ║  REMOVED:                                                                ║
+    ║  - 'approved': [] - UI MUST query backend for approval status            ║
+    ║  - 'rejected': [] - UI MUST query backend for rejection status           ║
+    ╚══════════════════════════════════════════════════════════════════════════╝
     """
     defaults = {
         # Workflow output
@@ -53,10 +64,18 @@ def init_session_state() -> None:
         'summary': None,              # Pre-computed counts (None = not computed yet, {} = computed but empty)
         'primary_message': None,      # Copywriter output
         
-        # UI state
+        # Phase 6: Correlation IDs
+        'current_decision_id': None,  # Decision ID from latest workflow run
+        'current_trace_id': None,     # Trace ID from latest workflow run
+        
+        # UI state (COSMETIC ONLY - not authoritative)
         'selected_card': None,        # Currently selected card for detail view
-        'approved': [],               # List of approved retailer_ids
-        'rejected': [],               # List of rejected retailer_ids
+        # REMOVED: 'approved': [] - CTO Correction #3: Backend is authoritative
+        # REMOVED: 'rejected': [] - CTO Correction #3: Backend is authoritative
+        
+        # v4 CTO Fix: UI staleness indicator
+        'approval_syncing': False,    # True during approval/rejection backend sync
+        'last_sync_time': None,       # Timestamp of last backend sync
         
         # Processing state
         'processing': False,          # Show spinner during workflow
@@ -189,23 +208,58 @@ def handle_card_action(card: dict, action: str) -> None:
     """
     Handle approve/reject/detail actions on a card.
     
-    Updates session state appropriately.
-    In production, this would also log to database.
+    ╔══════════════════════════════════════════════════════════════════════════╗
+    ║  PHASE 6 CTO CORRECTION #3: Backend is AUTHORITATIVE                     ║
+    ║                                                                          ║
+    ║  Approvals and rejections are persisted via ApprovalService.             ║
+    ║  Session state is NOT used for tracking approval status.                 ║
+    ║                                                                          ║
+    ║  v4 CTO Fix: UI shows syncing indicator during backend operations.       ║
+    ╚══════════════════════════════════════════════════════════════════════════╝
     """
-    retailer_id = card.get('retailer_id')
+    from datetime import datetime
+    
+    finding_id = card.get('finding_id')
     retailer_name = card.get('retailer_name') or card.get('name', 'Retailer')
     
+    if not finding_id:
+        st.warning(f"⚠️ Cannot process action: Missing finding_id for {retailer_name}")
+        return
+    
     if action == "approve":
-        if retailer_id and retailer_id not in st.session_state.approved:
-            st.session_state.approved.append(retailer_id)
-        st.success(f"✅ Action approved for {retailer_name}")
-        # In production: log to database, trigger notification system
+        try:
+            # v4 CTO Fix: Set syncing state for UI staleness indicator
+            st.session_state.approval_syncing = True
+            
+            from services.approval_service import ApprovalService
+            service = ApprovalService()
+            service.approve(finding_id, manager_id="manager")
+            
+            # v4: Update sync timestamp
+            st.session_state.last_sync_time = datetime.now()
+            st.success(f"✅ Action approved for {retailer_name}")
+        except Exception as e:
+            st.error(f"❌ Failed to approve: {e}")
+        finally:
+            st.session_state.approval_syncing = False
         
     elif action == "reject":
-        if retailer_id and retailer_id not in st.session_state.rejected:
-            st.session_state.rejected.append(retailer_id)
-        st.info(f"Action rejected for {retailer_name}")
-        # In production: log rejection reason
+        try:
+            # v4 CTO Fix: Set syncing state for UI staleness indicator
+            st.session_state.approval_syncing = True
+            
+            from services.approval_service import ApprovalService
+            service = ApprovalService()
+            # Default rejection category - in production, UI would ask user
+            service.reject(finding_id, manager_id="manager", category="TIMING_NOT_RIGHT")
+            
+            # v4: Update sync timestamp
+            st.session_state.last_sync_time = datetime.now()
+            st.info(f"Action rejected for {retailer_name}")
+        except Exception as e:
+            st.error(f"❌ Failed to reject: {e}")
+        finally:
+            st.session_state.approval_syncing = False
         
     elif action == "detail":
         st.session_state.selected_card = card
@@ -224,6 +278,10 @@ def process_scan_request() -> None:
             )
             
             st.session_state.workflow_result = result
+            
+            # Phase 6: Store correlation IDs
+            st.session_state.current_decision_id = result.get('decision_id')
+            st.session_state.current_trace_id = result.get('trace_id')
             
             if result.get('error'):
                 st.session_state.error_message = result['error']
@@ -254,6 +312,10 @@ def process_query_request(query: str) -> None:
             
             # Update state using SAME path as scan
             st.session_state.workflow_result = result
+            
+            # Phase 6: Store correlation IDs
+            st.session_state.current_decision_id = result.get('decision_id')
+            st.session_state.current_trace_id = result.get('trace_id')
             
             if result.get('error'):
                 st.session_state.error_message = result['error']
@@ -289,8 +351,37 @@ def render_metrics_bar() -> None:
     render_metrics(summary, retailer_count)
 
 
+def get_pending_finding_ids() -> set:
+    """
+    Get the set of finding_ids that are still pending.
+    
+    Phase 6: Query backend to determine which findings haven't been decided.
+    """
+    try:
+        from services.approval_service import ApprovalService
+        service = ApprovalService()
+        pending = service.get_pending()
+        return {p.finding_id for p in pending}
+    except Exception:
+        # If service fails, return empty set (show all cards)
+        return set()
+
+
 def render_priority_actions() -> None:
-    """Render the left panel with action cards."""
+    """
+    Render the left panel with action cards.
+    
+    ╔══════════════════════════════════════════════════════════════════════════╗
+    ║  PHASE 6 CTO CORRECTION #3: Backend is AUTHORITATIVE                     ║
+    ║                                                                          ║
+    ║  Active cards are determined by:                                         ║
+    ║  1. Findings from current workflow result (session state)                ║
+    ║  2. Filtered by ApprovalService.get_pending() (backend authority)        ║
+    ║                                                                          ║
+    ║  Session state only stores workflow output.                              ║
+    ║  Approval status ALWAYS comes from ApprovalService.                      ║
+    ╚══════════════════════════════════════════════════════════════════════════╝
+    """
     from ui.components import render_action_card
     
     st.subheader("Priority Actions")
@@ -304,12 +395,21 @@ def render_priority_actions() -> None:
     if st.session_state.error_message:
         st.error(f"⚠️ {st.session_state.error_message}")
     
-    # Get cards and filter out already processed
+    # Get cards from workflow result
     cards = st.session_state.action_cards
-    active_cards = [
-        c for c in cards 
-        if c.get('retailer_id') not in st.session_state.approved + st.session_state.rejected
-    ]
+    
+    # Phase 6: Filter by pending status from backend (not session state)
+    # Only show cards that are still pending in the approval system
+    pending_ids = get_pending_finding_ids()
+    
+    # If we have pending findings from backend, use those to filter
+    # Otherwise, show all cards (backend might not have them yet)
+    if pending_ids:
+        active_cards = [c for c in cards if c.get('finding_id') in pending_ids]
+    else:
+        # No backend data or backend empty - show workflow cards
+        # This handles the case where workflow just ran but findings aren't in approval system yet
+        active_cards = cards
     
     if active_cards:
         # Primary card (first one) - with defensive priority check
@@ -343,12 +443,22 @@ def render_priority_actions() -> None:
     else:
         st.info("👆 Click 'Scan for Risks' to analyze your retailer portfolio")
     
-    # Show approved/rejected counts
-    if st.session_state.approved or st.session_state.rejected:
-        st.caption(
-            f"Session: {len(st.session_state.approved)} approved, "
-            f"{len(st.session_state.rejected)} rejected"
-        )
+    # Phase 6: Show pending count from backend (not session state)
+    if pending_ids:
+        st.caption(f"📋 {len(pending_ids)} pending approval(s)")
+    
+    # v4 CTO Fix: UI staleness indicator
+    # Shows when approval status is being synced with backend
+    if st.session_state.get('approval_syncing', False):
+        st.info("⏳ Approval status syncing with backend...")
+    elif st.session_state.get('last_sync_time'):
+        # Show how recently the last sync happened (optional UX enhancement)
+        from datetime import datetime
+        sync_time = st.session_state.last_sync_time
+        if isinstance(sync_time, datetime):
+            age_seconds = (datetime.now() - sync_time).total_seconds()
+            if age_seconds < 5:
+                st.caption("✓ Status synced just now")
 
 
 def render_analysis_panel() -> None:
@@ -475,8 +585,4 @@ def main():
     render_query_console()
     
     # Footer
-    st.caption("SalesFlow AI v0.3.0 | Phase 3: UI & Interaction")
-
-
-if __name__ == "__main__":
-    main()
+    st.caption("SalesFlow AI v0.6.0 | Phase 6: HITL Integration & Backend Authority")
